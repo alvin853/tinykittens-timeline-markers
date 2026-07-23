@@ -48,7 +48,7 @@ stream. It is not affiliated with, endorsed by, or operated by TinyKittens
 HQ. It only adds this one feature to the YouTube player during their live
 streams, and does not modify, collect, or share any video or chat content
 - everything happens locally in your own browser. See
-[privacy-policy.html](privacy-policy.html) for details.
+[privacy-policy.html](https://alvin853.github.io/tinykittens-timeline-markers/privacy-policy.html) for details.
 
 Made with love for the cats and the community that shows up for them
 every day.
