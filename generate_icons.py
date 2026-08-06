@@ -55,5 +55,5 @@ def draw_cat_face(size):
 
 for size in SIZES:
     icon = draw_cat_face(size)
-    icon.save(f"icons/icon{size}.png")
-    print(f"wrote icons/icon{size}.png")
+    icon.save(f"extension/icons/icon{size}.png")
+    print(f"wrote extension/icons/icon{size}.png")
