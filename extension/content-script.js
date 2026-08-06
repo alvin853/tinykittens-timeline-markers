@@ -1,6 +1,13 @@
 (function () {
   'use strict';
 
+  // Runs in the MAIN world (see manifest.json's "world": "MAIN" on this
+  // file's content_scripts entries) - the real page context directly, no
+  // Tampermonkey-style sandboxing to work around, so plain `window`
+  // (unlike the userscript version of this file, which needs a
+  // pageWindow/unsafeWindow indirection specifically for that) is
+  // correct here.
+
   // ---------------------------------------------------------------------
   // CONFIG — edit these for your setup
   // ---------------------------------------------------------------------
@@ -16,12 +23,22 @@
     // a fallback in case videoDetails omits channelId for some reason.
     allowedChannelId: 'UCeL2LSl91k2VccR7XEh5IKg', // TinyKittens HQ, https://www.youtube.com/@TinyKittens
     allowedChannelName: 'TinyKittens HQ',
-    // YouTube's 12h live-DVR scrollback limit is a UI-level policy, not
-    // something reflected in video.seekable (that reports whatever's
-    // actually buffered, which can run ahead of what the seekbar exposes).
-    // So we hardcode the nominal window here and clamp it to the actual
-    // video.duration, which handles streams younger than this window too.
-    dvrWindowSeconds: 12 * 60 * 60,
+    // player.seekTo() (the internal player object's own seek method) seeks
+    // using the SAME "seconds since actual stream start" coordinate
+    // system as aria-valuemax/valuemin. Confirmed reliable via real-world
+    // testing (with the pause-aware retry below for the one case it
+    // needed help with) - a separate simulated-click fallback existed
+    // earlier but was removed after testing never once found it necessary.
+    // While paused, the player's own internal notion of its valid seek
+    // range can be stale (confirmed via testing: a seek attempted in
+    // this state can silently clamp to the stale range's edge instead of
+    // landing on the real target, but the seek ATTEMPT itself appears to
+    // trigger the player to reconcile its range with reality shortly
+    // after). Only relevant while paused - while actively playing, the
+    // bar keeps refreshing on its own, so this adds no delay to the
+    // common case. See seekToWhilePaused below.
+    pausedSeekRefreshPollIntervalMs: 150,
+    pausedSeekRefreshMaxWaitMs: 2000,
     // Whether to only trust timestamps posted by moderators/the channel
     // owner, or parse them from any chat author. User-configurable via
     // the settings panel; see TRUSTED_BADGES below for the actual badge
@@ -32,29 +49,15 @@
     renderIntervalMs: 5000,
     // BroadcastChannel name bridging the chat iframe <-> parent watch page.
     channelName: 'cat-rescue-chat-markers-v1',
-    // How far back the player's seekbar actually reaches. Events older than
-    // this can never be placed (they'd fall before position 0) so we evict
-    // them from memory instead of holding onto them forever.
+    // FALLBACK ONLY: used if the true seekable range (aria-valuemin/
+    // aria-valuemax) isn't available when pruning runs. Otherwise,
+    // pruneOldEvents uses the actual current window size directly - see
+    // pruneOldEvents below.
     maxEventAgeMs: 12 * 60 * 60 * 1000,
     // Verbose console logging for every stage of parsing/rendering. Off
     // by default for regular users - toggleable in the settings panel for
     // when debug data is actually needed (e.g. troubleshooting a report).
     debug: false,
-    // How close (in seconds) a simulated click needs to land to the
-    // intended target before we consider it acceptable. Generous on
-    // purpose: see the note on enableDirectSeekFallback below for why.
-    seekDriftToleranceSeconds: 5 * 60,
-    // Setting video.currentTime directly for a live DVR stream is
-    // fundamentally unreliable: per the HTML5 spec, currentTime semantics
-    // for live media are unspecified, and YouTube's own DVR buffer can
-    // silently skip segments during low-viewership periods, so there's no
-    // formula that reliably maps "wall-clock event time" to a target
-    // currentTime - the drift isn't even constant, it grows unpredictably
-    // over a stream's runtime. Simulating a real click at the correct
-    // pixel position sidesteps this (it rides on whatever mapping the
-    // bar itself already uses), so the direct-assignment fallback is
-    // disabled by default. Flip this on only if you want to experiment.
-    enableDirectSeekFallback: false,
     // Persistent (always-visible, not just on hover) label layout tuning.
     // Nearby labels merge into a single multi-line cluster box instead of
     // each getting its own - rotated text's horizontal footprint is small
@@ -127,6 +130,32 @@
   }
   let SIZES = computeSizes(); // reassigned (not just mutated) when fontSizePx changes - see the settings message listener near the end of this file
 
+  // Keys the settings panel can change - kept in one list so the message
+  // listener and save functions near the end of this file don't drift
+  // from each other.
+  const GLOBAL_SETTING_KEYS = ['moderatorOnly', 'fontSizePx', 'showLabels', 'showHourlyMarkers', 'debug'];
+
+  // The single place a global setting actually takes effect on CONFIG/
+  // SIZES, used uniformly whether the change came from this tab's own
+  // settings panel, the initial async load from storage-bridge.js, or a
+  // synced change relayed from another device.
+  function applyGlobalSetting(name, value) {
+    const fontSizeChanged = name === 'fontSizePx' && value !== CONFIG.fontSizePx;
+    CONFIG[name] = value;
+    if (fontSizeChanged) {
+      SIZES = computeSizes();
+      log(`Settings: fontSizePx changed to ${CONFIG.fontSizePx}, recomputed SIZES.`);
+    }
+  }
+
+  // Persisted settings load asynchronously here (not synchronously like
+  // the userscript version's GM_getValue, which has no equivalent in a
+  // Chrome extension) - see the message listener near the end of this
+  // file for where storage-bridge.js's 'init' message actually applies
+  // the loaded values via applyGlobalSetting above. Until that arrives,
+  // CONFIG's hardcoded defaults (and the SIZES computed from them just
+  // above) are what's in effect.
+
   const inIframe = window.self !== window.top;
   // BroadcastChannel is scoped by name *within the whole origin*, not per
   // tab - two tabs both on youtube.com sharing the same literal channel
@@ -193,9 +222,14 @@
   let lastLoggedEnabledState = null;
   // Manual per-video override from the settings panel: null = no
   // override (use automatic live+channel detection below), true/false =
-  // force on/off regardless of what detection would say. Populated by
-  // the settings message listener near the end of this file.
+  // force on/off regardless of what detection would say. Loaded
+  // asynchronously via storage-bridge.js's 'init' message, and kept in
+  // sync by its 'update' messages - see the settings message listener
+  // near the end of this file.
   let perVideoEnabledOverride = null;
+  // videoId is already computed above (const videoId = resolveVideoId();) -
+  // reused here rather than recomputed.
+  const perVideoStorageKey = videoId ? `perVideoEnabled:${videoId}` : null;
   // Only ENABLED when the current video is (a) actually live right now,
   // and (b) on the configured channel - unless perVideoEnabledOverride
   // says otherwise. Checked at processing/render time (not just once at
@@ -245,20 +279,30 @@
 
   // The chat iframe's initial HTML embeds the currently-visible backlog as
   // `window["ytInitialData"] = {...}` in an inline <script>. Since this
-  // userscript runs at document-start (before the page's own scripts run),
-  // we can define a property setter that fires the moment YouTube assigns
-  // it, letting us parse the backlog the same way we parse poll responses.
+  // content script runs at document_start (before the page's own scripts
+  // run - see manifest.json), we can define a property setter that fires
+  // the moment YouTube assigns it, letting us parse the backlog the same
+  // way we parse poll responses.
   function hookInitialData() {
     let captured = false;
+    // Closure-scoped, NOT stored on `this` (e.g. this.__ytInitialDataValue).
+    // An earlier version of this getter/setter used `this` as the backing
+    // store - fragile in general, since it depends on the accessor always
+    // being invoked with the expected receiver bound (this script runs in
+    // strict mode, where a function called without an explicit receiver
+    // gets `this === undefined` rather than falling back to the global
+    // object). A plain closure variable has no such dependency, so it's
+    // used instead.
+    let capturedValue;
     try {
       Object.defineProperty(window, 'ytInitialData', {
         configurable: true,
         enumerable: true,
         get() {
-          return this.__ytInitialDataValue;
+          return capturedValue;
         },
         set(value) {
-          this.__ytInitialDataValue = value;
+          capturedValue = value;
           if (!captured) {
             captured = true;
             log('Captured window.ytInitialData (initial chat backlog).');
@@ -302,14 +346,14 @@
   }
 
   function hookXHR() {
-    const nativeOpen = XMLHttpRequest.prototype.open;
-    const nativeSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    const nativeOpen = window.XMLHttpRequest.prototype.open;
+    const nativeSend = window.XMLHttpRequest.prototype.send;
+    window.XMLHttpRequest.prototype.open = function (method, url, ...rest) {
       this.__isLiveChat =
         typeof url === 'string' && url.includes('/youtubei/v1/live_chat/get_live_chat');
       return nativeOpen.call(this, method, url, ...rest);
     };
-    XMLHttpRequest.prototype.send = function (...args) {
+    window.XMLHttpRequest.prototype.send = function (...args) {
       if (this.__isLiveChat) {
         this.addEventListener('load', () => {
           try {
@@ -540,11 +584,19 @@
     }, CONFIG.renderIntervalMs);
   }
 
-  // Drops any event older than maxEventAgeMs - it's fallen off the seekbar's
-  // scrollback range and can never be placed, so there's no reason to keep
-  // it in memory for a 24/7 stream.
+  // Drops any event that's fallen outside the current true seekable range
+  // - it can never be placed on the bar, so there's no reason to keep it
+  // in memory for a 24/7 stream. Queries a live (non-pause-corrected)
+  // reading directly, since pruning only needs a reasonable upper bound
+  // on how far back an event could still matter, not split-second
+  // precision - falls back to the fixed maxEventAgeMs estimate if the
+  // true range isn't available for some reason.
   function pruneOldEvents(seenEvents) {
-    const cutoff = Date.now() - CONFIG.maxEventAgeMs;
+    const progressBar = document.querySelector('.ytp-progress-bar');
+    const trueRange = getTrueSeekableRange(progressBar);
+    const maxAgeMs = trueRange ? (trueRange.end - trueRange.start) * 1000 : CONFIG.maxEventAgeMs;
+
+    const cutoff = Date.now() - maxAgeMs;
     let removed = 0;
     for (const [key, evt] of seenEvents) {
       if (evt.epochMs < cutoff) {
@@ -553,59 +605,249 @@
       }
     }
     if (removed) {
-      log(`pruneOldEvents: dropped ${removed} event(s) older than ${CONFIG.maxEventAgeMs / 3600000}h. ${seenEvents.size} remaining.`);
+      log(
+        `pruneOldEvents: dropped ${removed} event(s) older than ${(maxAgeMs / 3600000).toFixed(2)}h ` +
+          `(${trueRange ? 'true range' : 'fallback estimate'}). ${seenEvents.size} remaining.`
+      );
     }
   }
 
-  // YouTube's live-DVR seekbar covers a fixed trailing window (nominally
-  // 12h), but that limit is enforced in YouTube's own UI/JS - it is NOT
-  // reflected in video.seekable, which instead reports whatever range the
-  // browser has actually buffered (can run longer than what's scrubbable).
-  // So we derive the range ourselves: live edge = video.duration, and the
-  // window is whichever is smaller of the nominal DVR length or the
-  // stream's actual elapsed duration (for streams younger than the window).
-  function getSeekableRange(video) {
-    const end = video.duration;
-    const window = Math.min(CONFIG.dvrWindowSeconds, end);
-    return { start: end - window, end };
+  // The progress bar's own ARIA slider attributes (aria-valuemin/
+  // aria-valuemax) describe the REAL rendered bounds of the bar itself,
+  // in a "seconds since the actual stream started" coordinate system
+  // (confirmed by decoding aria-valuetext, which matches these numbers
+  // exactly, and matches player.getCurrentTime()/getDuration() - a
+  // DIFFERENT coordinate system than video.currentTime/video.duration,
+  // which are anchored to whatever the currently-loaded media buffer
+  // considers its own zero point). This is the authoritative source: no
+  // guessing at a nominal window length, no clamping - whatever the bar
+  // itself is actually showing right now, including cases where the
+  // window runs past the nominal 12h (observed during an extended pause)
+  // or is temporarily unusual for some other reason.
+  // ---------------------------------------------------------------------
+  // Pause correction. YouTube's progress bar (and its aria attributes)
+  // appears to stop updating while the LOCAL player is paused - this is a
+  // player/UI-level freeze specific to this viewer's own paused state,
+  // not a stream-side event (unlike the stream-gap detector above, which
+  // handles the feed itself dropping for everyone - a different
+  // phenomenon that happens to look similar, kept as a separate
+  // mechanism on purpose rather than reused/extended for this).
+  //
+  // Rather than depending on exactly how that freeze behaves internally,
+  // this only relies on two things that are unambiguous: precisely when
+  // a pause starts and precisely when it ends, both from native video
+  // events. The moment pausing begins, the true range is snapshotted
+  // while still fresh; while paused, that snapshot is offset forward by
+  // however much real time has elapsed since, instead of re-reading the
+  // (possibly stale) DOM at all. The instant playback resumes, the
+  // snapshot is dropped and the live DOM is trusted again - this assumes
+  // resuming snaps the bar back to the correct position immediately
+  // rather than leaving a permanent gap, matching what was observed
+  // (worth reconfirming this holds once tested for real).
+  // ---------------------------------------------------------------------
+  let pauseStartedAtMs = null;
+  let pauseSnapshotRange = null;
+  let pauseListenersAttached = false;
+
+  // Shared by the 'pause' handler and the 'seeked' handler below - a
+  // fresh snapshot is needed at both moments: when a pause begins, and
+  // whenever the position changes WHILE paused (see 'seeked' below).
+  function refreshPauseSnapshot(progressBar, reason) {
+    pauseStartedAtMs = Date.now();
+    pauseSnapshotRange = getTrueSeekableRange(progressBar);
+    log(
+      pauseSnapshotRange
+        ? `${reason} - snapshotting true range=[${pauseSnapshotRange.start.toFixed(1)}, ${pauseSnapshotRange.end.toFixed(1)}].`
+        : `${reason} - no true range available to snapshot, will fall back to live reads/estimate.`
+    );
   }
 
-  // Setting video.currentTime directly is unreliable for a live DVR stream:
-  // per the HTML5 spec, currentTime semantics are unspecified for live
-  // media, and YouTube's own DVR buffer can silently skip segments during
-  // low-viewership periods - so there's no stable formula from "wall-clock
-  // event time" to a target currentTime (confirmed via testing: the drift
-  // wasn't even constant, it grew unpredictably over the stream's runtime).
-  // Simulating a real click at the correct pixel position sidesteps all of
-  // that, since it rides on whatever mapping the bar itself already uses.
-  function seekTo(video, progressBar, pct, intendedSeconds) {
-    const rect = progressBar.getBoundingClientRect();
-    const clientX = rect.left + (pct / 100) * rect.width;
-    const clientY = rect.top + rect.height / 2;
-    const opts = { bubbles: true, cancelable: true, clientX, clientY, view: window };
+  function ensurePauseTracking(video, progressBar) {
+    if (pauseListenersAttached || !video) return;
+    pauseListenersAttached = true;
 
-    log(`seekTo: simulating click at pct=${pct.toFixed(2)}% (clientX=${clientX.toFixed(1)}) targeting ${intendedSeconds.toFixed(1)}s`);
-    progressBar.dispatchEvent(new MouseEvent('mousedown', opts));
-    progressBar.dispatchEvent(new MouseEvent('mouseup', opts));
-    progressBar.dispatchEvent(new MouseEvent('click', opts));
+    video.addEventListener('pause', () => {
+      refreshPauseSnapshot(progressBar, 'Paused');
+    });
 
-    setTimeout(() => {
-      const drift = Math.abs(video.currentTime - intendedSeconds);
-      if (drift > CONFIG.seekDriftToleranceSeconds) {
-        log(
-          `seekTo: synthetic click landed ${drift.toFixed(1)}s from intended target ` +
-            `(currentTime=${video.currentTime.toFixed(1)}, intended=${intendedSeconds.toFixed(1)}).` +
-            (CONFIG.enableDirectSeekFallback
-              ? ' Falling back to direct currentTime assignment (unreliable, enabled via config).'
-              : ' Direct-assignment fallback is disabled (unreliable for live DVR) - leaving as-is.')
-        );
-        if (CONFIG.enableDirectSeekFallback) {
-          video.currentTime = intendedSeconds;
-        }
-      } else {
-        log(`seekTo: landed within ${drift.toFixed(1)}s of intended target - good.`);
+    // Seeking while paused (whether the person manually dragged the
+    // scrubber, or clicked one of our own markers) visibly updates the
+    // bar even though the passage of time alone doesn't - the person's
+    // own testing confirmed this. 'seeked' fires either way, so this
+    // covers both without needing to tell them apart: take a fresh
+    // snapshot and restart the offset-tracking clock from this new,
+    // known-correct point, rather than continuing to extrapolate from
+    // the original (now-outdated) pre-seek snapshot.
+    video.addEventListener('seeked', () => {
+      if (video.paused) {
+        refreshPauseSnapshot(progressBar, 'Seeked while paused');
       }
-    }, 400);
+    });
+
+    video.addEventListener('play', () => {
+      if (pauseStartedAtMs !== null) {
+        const pausedForSec = (Date.now() - pauseStartedAtMs) / 1000;
+        log(`Resumed after ~${pausedForSec.toFixed(1)}s paused - trusting live bar values again.`);
+      }
+      pauseStartedAtMs = null;
+      pauseSnapshotRange = null;
+    });
+
+    // If the video was ALREADY paused by the time this attached (e.g.
+    // the script's first render pass happens mid-pause), the 'pause'
+    // event itself already fired and was missed - without this, we'd
+    // have no snapshot at all until the NEXT full pause/resume cycle,
+    // leaving the current, already-in-progress pause uncorrected. Take
+    // a snapshot now as a best-effort catch-up; it may already be
+    // slightly stale by this point, but that's strictly better than no
+    // correction at all for the remainder of this pause.
+    if (video.paused) {
+      refreshPauseSnapshot(progressBar, 'Already paused when tracking attached');
+    }
+  }
+
+  // Returns the true range, correcting for the pause-freeze if currently
+  // paused with a valid snapshot; otherwise just the live read.
+  function getPauseCorrectedTrueRange(progressBar) {
+    if (pauseStartedAtMs !== null && pauseSnapshotRange) {
+      const pausedForSec = (Date.now() - pauseStartedAtMs) / 1000;
+      return {
+        start: pauseSnapshotRange.start + pausedForSec,
+        end: pauseSnapshotRange.end + pausedForSec,
+      };
+    }
+    return getTrueSeekableRange(progressBar);
+  }
+
+  function getTrueSeekableRange(progressBar) {
+    if (!progressBar) return null;
+    const minAttr = progressBar.getAttribute('aria-valuemin');
+    const maxAttr = progressBar.getAttribute('aria-valuemax');
+    if (minAttr === null || maxAttr === null) return null;
+    const start = parseFloat(minAttr);
+    const end = parseFloat(maxAttr);
+    if (!isFinite(start) || !isFinite(end) || end <= start) return null;
+    return { start, end };
+  }
+
+  function getPlayerRoot() {
+    return document.querySelector('#movie_player') || document.querySelector('.html5-video-player');
+  }
+
+  // player.getCurrentTime() reports in the same "seconds since actual
+  // stream start" coordinate system as aria-valuemax/valuemin - distinct
+  // from video.currentTime, which is anchored to the currently-loaded
+  // media buffer's own zero point instead. Wrapped defensively since
+  // this is an internal (undocumented) property of the player element,
+  // not a stable public API - it could change or be missing in some
+  // player builds.
+  function tryGetPlayerTrueCurrentTime() {
+    try {
+      const playerRoot = getPlayerRoot();
+      const t = playerRoot && typeof playerRoot.getCurrentTime === 'function' ? playerRoot.getCurrentTime() : null;
+      return typeof t === 'number' && isFinite(t) ? t : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Entry point for all seeking. When we have true (aria-derived)
+  // coordinates, player.seekTo() - the player's own internal seek method,
+  // using the exact same coordinate system aria-valuemax/valuemin do -
+  // Entry point for all seeking. player.seekTo() - the player's own
+  // internal seek method, using the exact same coordinate system
+  // aria-valuemax/valuemin do - confirmed reliable via real-world
+  // testing (with the pause-aware retry below for the one case it
+  // needed help with). A simulated-click fallback existed here
+  // previously but was removed after testing never once found it
+  // necessary; logSeekDriftOutcome below is now purely diagnostic
+  // rather than triggering a fallback.
+  function seekTo(video, progressBar, intendedSeconds) {
+    const playerRoot = getPlayerRoot();
+    if (!playerRoot || typeof playerRoot.seekTo !== 'function') {
+      log('seekTo: player.seekTo not available - cannot seek.');
+      return;
+    }
+
+    // Only relevant while paused - see seekToWhilePaused for why. While
+    // actively playing, the bar keeps refreshing on its own, so the
+    // ordinary path below (unchanged) applies with no extra delay.
+    if (video.paused) {
+      seekToWhilePaused(intendedSeconds, progressBar, playerRoot);
+      return;
+    }
+
+    try {
+      log(`seekTo: trying player.seekTo(${intendedSeconds.toFixed(1)}, true)`);
+      playerRoot.seekTo(intendedSeconds, true);
+    } catch (e) {
+      log('seekTo: player.seekTo threw.', e);
+      return;
+    }
+
+    setTimeout(() => logSeekDriftOutcome(intendedSeconds), 400);
+  }
+
+  // While paused, the player's own internal notion of its valid seek
+  // range can go stale (frozen since the pause began, or since the last
+  // seek) - a seek attempted in this state can silently clamp to wherever
+  // the player still thinks the edge is, rather than landing on the real
+  // target. Confirmed via testing: the FIRST seek attempt in this
+  // situation both lands wrong AND appears to trigger the player to
+  // reconcile its internal range with reality shortly after (visible as
+  // aria-valuemax jumping forward within about a second). So: watch for
+  // that jump, and if it happens, retry the SAME seek once - this mirrors
+  // exactly what manually clicking a marker a second time was already
+  // doing to work around this. If no jump is detected within the poll
+  // window, nothing was stale to begin with - proceed straight to
+  // logging the drift outcome.
+  function seekToWhilePaused(intendedSeconds, progressBar, playerRoot) {
+    const staleValueMax = progressBar.getAttribute('aria-valuemax');
+
+    try {
+      log(`seekTo: trying player.seekTo(${intendedSeconds.toFixed(1)}, true) (paused - watching for a stale-range refresh)`);
+      playerRoot.seekTo(intendedSeconds, true);
+    } catch (e) {
+      log('seekTo: player.seekTo threw.', e);
+      return;
+    }
+
+    const startedAtMs = Date.now();
+
+    function poll() {
+      const currentValueMax = progressBar.getAttribute('aria-valuemax');
+      if (currentValueMax !== null && currentValueMax !== staleValueMax) {
+        log(`seekTo: detected stale-range refresh (aria-valuemax ${staleValueMax} -> ${currentValueMax}) - retrying seek.`);
+        try {
+          playerRoot.seekTo(intendedSeconds, true);
+        } catch (e) {
+          log('seekTo: retry player.seekTo threw.', e);
+          return;
+        }
+        setTimeout(() => logSeekDriftOutcome(intendedSeconds), 400);
+        return;
+      }
+
+      if (Date.now() - startedAtMs >= CONFIG.pausedSeekRefreshMaxWaitMs) {
+        log(`seekTo: no stale-range refresh detected within ${CONFIG.pausedSeekRefreshMaxWaitMs}ms - proceeding to normal drift check.`);
+        logSeekDriftOutcome(intendedSeconds);
+        return;
+      }
+
+      setTimeout(poll, CONFIG.pausedSeekRefreshPollIntervalMs);
+    }
+
+    setTimeout(poll, CONFIG.pausedSeekRefreshPollIntervalMs);
+  }
+
+  // Purely diagnostic - no fallback left to trigger, and no threshold to
+  // pre-filter "acceptable" from "not," since that distinction doesn't
+  // actually help once there's no corrective action tied to it. Just logs
+  // the real drift amount, unfiltered, for whenever it's actually needed.
+  function logSeekDriftOutcome(intendedSeconds) {
+    const actualTrue = tryGetPlayerTrueCurrentTime();
+    const drift = actualTrue === null ? null : Math.abs(actualTrue - intendedSeconds);
+    log(`seekTo: landed ${drift === null ? 'at an unknown position (player.getCurrentTime unavailable)' : `${drift.toFixed(1)}s from intended target`}.`);
   }
 
   function renderMarkers(seenEvents) {
@@ -631,15 +873,22 @@
       return;
     }
 
-    const { start: seekStart, end: seekEnd } = getSeekableRange(video);
+    ensurePauseTracking(video, progressBar);
+
+    const trueRange = getPauseCorrectedTrueRange(progressBar);
+    if (!trueRange) {
+      log('renderMarkers: true seekable range not available (aria attributes missing?) - skipping render.');
+      return;
+    }
+    const { start: seekStart, end: seekEnd } = trueRange;
     const seekWindow = seekEnd - seekStart;
     if (!seekWindow || !isFinite(seekWindow) || seekWindow <= 0) {
       log('renderMarkers: invalid seekable window, skipping render.', { seekStart, seekEnd });
       return;
     }
     log(
-      `renderMarkers: video.duration=${video.duration.toFixed(1)}s, ` +
-        `seekable=[${seekStart.toFixed(1)}, ${seekEnd.toFixed(1)}] (window=${(seekWindow / 3600).toFixed(2)}h)`
+      `renderMarkers: seekable=[${seekStart.toFixed(1)}, ${seekEnd.toFixed(1)}] ` +
+        `(window=${(seekWindow / 3600).toFixed(2)}h, source=aria-valuemin/valuemax, video.duration=${video.duration.toFixed(1)}s for reference)`
     );
 
     // Attach to the *container*, not .ytp-progress-bar itself - YouTube
@@ -764,7 +1013,7 @@
     let placed = 0;
     for (const evt of visible) {
       placed++;
-      const doSeek = () => seekTo(video, progressBar, evt.pct, evt.positionSeconds);
+      const doSeek = () => seekTo(video, progressBar, evt.positionSeconds);
 
       if (evt.isHourly) {
         log(`renderMarkers: placing hourly tick at ${evt.pct.toFixed(2)}% (${formatWallClock(evt.epochMs)})`);
@@ -967,7 +1216,7 @@
       });
       line.addEventListener('click', (e) => {
         e.stopPropagation();
-        seekTo(video, progressBar, m.pct, m.positionSeconds);
+        seekTo(video, progressBar, m.positionSeconds);
       });
       wrapper.appendChild(line);
     }
@@ -1110,7 +1359,7 @@
   let autohideObserverAttached = false;
   function ensureAutohideWatcher() {
     if (autohideObserverAttached) return;
-    const playerRoot = document.querySelector('#movie_player') || document.querySelector('.html5-video-player');
+    const playerRoot = getPlayerRoot();
     if (!playerRoot) return;
 
     autohideObserverAttached = true;
@@ -1150,11 +1399,13 @@
   // multi-level settings menu - that's a lot of machinery for 5 toggles
   // and a stepper) appended inside #movie_player so it stays visible in
   // fullscreen, matching the same reasoning as the button placement
-  // itself. Every control here only ever sends a 'save' message to
-  // storage-bridge.js; the actual applying of the new value happens
-  // uniformly through the existing settings message listener below,
-  // whether the change came from this panel, a synced change on another
-  // device, or the initial load - one code path, not two.
+  // itself. Every control here sends a 'save' message to storage-bridge.js
+  // (the only piece of the extension with chrome.storage access, since
+  // this file runs in the MAIN world); the actual applying of the new
+  // value happens uniformly through applyGlobalSetting in the message
+  // listener near the end of this file, once the bridge relays it back -
+  // whether the change came from this panel, another tab, or the initial
+  // load, one code path, not two.
   // =======================================================================
   let settingsPanelEl = null;
   const panelSyncFns = []; // each control's own "update my visual state from CONFIG" function
@@ -1354,7 +1605,7 @@
   }
 
   function toggleSettingsPanel() {
-    const playerRoot = document.querySelector('#movie_player') || document.querySelector('.html5-video-player');
+    const playerRoot = getPlayerRoot();
     if (!playerRoot) return;
 
     if (!settingsPanelEl) {
@@ -1392,6 +1643,9 @@
   // - and relays values here via postMessage. Handles both the initial
   // load (msg.type === 'init') and live updates from the settings panel
   // or a synced change on another device (msg.type === 'update').
+  // moderatorOnly and debug matter in the chat-iframe context too (they
+  // affect parsing/logging there), so this listener isn't gated on
+  // !inIframe - only the render/panel-refresh side effects are.
   // ---------------------------------------------------------------------
   window.addEventListener('message', (event) => {
     if (event.source !== window || event.origin !== location.origin) return;
@@ -1400,11 +1654,8 @@
     if (msg.type !== 'init' && msg.type !== 'update') return;
 
     if (msg.settings) {
-      const fontSizeChanged = 'fontSizePx' in msg.settings && msg.settings.fontSizePx !== CONFIG.fontSizePx;
-      Object.assign(CONFIG, msg.settings);
-      if (fontSizeChanged) {
-        SIZES = computeSizes();
-        log(`Settings: fontSizePx changed to ${CONFIG.fontSizePx}, recomputed SIZES.`);
+      for (const [key, value] of Object.entries(msg.settings)) {
+        applyGlobalSetting(key, value);
       }
       log(`Settings ${msg.type}:`, msg.settings);
     }

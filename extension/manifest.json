@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "TinyKittens Chat Timeline Markers",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Overlays clickable markers on the TinyKittens live stream progress bar, parsed from moderator-posted chat timestamps.",
   "permissions": ["storage"],
   "content_scripts": [
