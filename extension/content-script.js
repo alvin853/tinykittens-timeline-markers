@@ -453,7 +453,7 @@
       .filter(Boolean);
 
     for (const chunk of chunks) {
-      const match = chunk.match(/^(\d{1,2}):(\d{2})\s*([AaPp][Mm])\s*-\s*(.+)$/);
+      const match = chunk.match(/^(\d{1,2}):(\d{2})\s*([AaPp][Mm])\s*-?\s*(.+)$/);
       if (!match) continue;
       const [, hh, mm, meridiem, label] = match;
       const eventDate = resolveEventDate(hh, mm, meridiem, sentAtMs);

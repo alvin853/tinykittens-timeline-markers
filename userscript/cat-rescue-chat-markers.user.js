@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TinyKittens HQ Timeline Markers
 // @namespace    tinykittens-chat-markers
-// @version      0.2.0
+// @version      0.2.1
 // @description  Parses moderator-posted "⏪ 8:14 PM - event" timestamps in the TinyKittens HQ live chat and overlays them as clickable markers on the live stream's progress bar. Unofficial fan project - not affiliated with TinyKittens HQ.
 // @match        https://www.youtube.com/watch*
 // @match        https://www.youtube.com/live_chat*
@@ -503,7 +503,7 @@
       .filter(Boolean);
 
     for (const chunk of chunks) {
-      const match = chunk.match(/^(\d{1,2}):(\d{2})\s*([AaPp][Mm])\s*-\s*(.+)$/);
+      const match = chunk.match(/^(\d{1,2}):(\d{2})\s*([AaPp][Mm])\s*-?\s*(.+)$/);
       if (!match) continue;
       const [, hh, mm, meridiem, label] = match;
       const eventDate = resolveEventDate(hh, mm, meridiem, sentAtMs);
