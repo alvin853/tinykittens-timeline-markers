@@ -1,9 +1,12 @@
 // ==UserScript==
 // @name         TinyKittens HQ Timeline Markers
 // @namespace    tinykittens-chat-markers
-// @version      0.2.1
+// @version      0.2.2
 // @description  Parses moderator-posted "⏪ 8:14 PM - event" timestamps in the TinyKittens HQ live chat and overlays them as clickable markers on the live stream's progress bar. Unofficial fan project - not affiliated with TinyKittens HQ.
 // @match        https://www.youtube.com/watch*
+// @match        https://www.youtube.com/live/*
+// @match        https://www.youtube.com/*/live
+// @match        https://www.youtube.com/*/live?*
 // @match        https://www.youtube.com/live_chat*
 // @updateURL    https://raw.githubusercontent.com/alvin853/tinykittens-timeline-markers/main/userscript/cat-rescue-chat-markers.user.js
 // @downloadURL  https://raw.githubusercontent.com/alvin853/tinykittens-timeline-markers/main/userscript/cat-rescue-chat-markers.user.js
@@ -86,7 +89,11 @@
     // the settings panel; see TRUSTED_BADGES below for the actual badge
     // list this checks against.
     moderatorOnly: true,
-    markerEmoji: '⏪',
+    // A message counts as a timestamp if it contains ANY of these. ⏪ is
+    // what the moderators use; ⏩ is included because regular chatters
+    // often reach for it by accident when marking a moment. Deliberately
+    // not exposed in the settings panel.
+    markerEmojis: ['⏪', '⏩'],
     // Re-render markers this often (ms) - duration keeps growing on a live stream.
     renderIntervalMs: 5000,
     // BroadcastChannel name bridging the chat iframe <-> parent watch page.
@@ -213,26 +220,47 @@
   // window.top.location.href directly - no CORS restriction applies to
   // same-origin frames. document.referrer is a fallback in case that
   // access is ever blocked (e.g. a sandboxed embed elsewhere).
-  const videoId = resolveVideoId();
-  const channelName = videoId ? `${CONFIG.channelName}:${videoId}` : CONFIG.channelName;
-  const bc = new BroadcastChannel(channelName);
+  //
+  // These three are `let` only for /live-style URLs that don't carry the
+  // video ID at all (e.g. /@TinyKittens/live): there the watch page can't
+  // know the ID yet at document_start and fills it in a moment later -
+  // see the "late-resolved video ID" block in CONTEXT B below. On
+  // /watch?v= and /live/<id> URLs they're set once, right here.
+  let videoId = resolveVideoId();
+  let channelName = videoId ? `${CONFIG.channelName}:${videoId}` : CONFIG.channelName;
+  let bc = new BroadcastChannel(channelName);
   const TAG = '[cat-rescue-markers]';
   const TRUSTED_BADGES = ['MODERATOR', 'OWNER']; // what CONFIG.moderatorOnly checks against
+  // Matches any one of CONFIG.markerEmojis, plus the invisible "emoji
+  // presentation" selector (U+FE0F) some keyboards append right after it.
+  const MARKER_SPLIT_REGEX = new RegExp(`(?:${CONFIG.markerEmojis.join('|')})\\uFE0F?`, 'u');
   function log(...args) {
     if (CONFIG.debug) console.log(TAG, ...args);
   }
   log(`videoId=${videoId || '(none found)'}  channel=${channelName}`);
 
+  // Handles /watch?v=<id> as well as the /live/<id> form YouTube uses for
+  // some livestream links.
   function getVideoIdFromUrl(href) {
     try {
-      return new URL(href).searchParams.get('v');
+      const url = new URL(href);
+      const fromQuery = url.searchParams.get('v');
+      if (fromQuery) return fromQuery;
+      const fromLivePath = url.pathname.match(/^\/live\/([\w-]+)/);
+      return fromLivePath ? fromLivePath[1] : null;
     } catch (e) {
       return null;
     }
   }
 
   function resolveVideoId() {
-    if (!inIframe) return getVideoIdFromUrl(location.href);
+    // Last resort for both contexts, for URLs with no video ID in them at
+    // all (/@handle/live, /channel/<id>/live): the player response YouTube
+    // embeds in the watch page. The chat iframe loads well after that
+    // exists, so this resolves immediately there; the watch page itself
+    // runs before it exists (document_start) and gets null here, then
+    // picks the ID up shortly after - see "late-resolved video ID" below.
+    if (!inIframe) return getVideoIdFromUrl(location.href) || getVideoDetails()?.videoId || null;
 
     try {
       const fromTop = getVideoIdFromUrl(window.top.location.href);
@@ -244,7 +272,7 @@
     const fromReferrer = getVideoIdFromUrl(document.referrer);
     if (fromReferrer) return fromReferrer;
 
-    return null;
+    return getVideoDetails()?.videoId || null;
   }
 
   // YouTube embeds `window.ytInitialPlayerResponse` on every watch page,
@@ -272,7 +300,7 @@
   let perVideoEnabledOverride = null;
   // videoId is already computed above (const videoId = resolveVideoId();) -
   // reused here rather than recomputed.
-  const perVideoStorageKey = videoId ? `perVideoEnabled:${videoId}` : null;
+  let perVideoStorageKey = videoId ? `perVideoEnabled:${videoId}` : null; // `let`: see the late-resolved video ID block below
   if (perVideoStorageKey) {
     const storedPerVideo = GM_getValue(perVideoStorageKey, null);
     if (storedPerVideo !== null) perVideoEnabledOverride = storedPerVideo;
@@ -315,11 +343,22 @@
   // Responsible for: intercepting the polling requests, extracting events,
   // broadcasting them to the parent page.
   // =======================================================================
+  // Everything this iframe has broadcast so far (keyed by time, like the
+  // parent's own map), so it can be repeated if the parent asks - which it
+  // only does after joining the channel late, see "late-resolved video ID"
+  // below. A handful of small entries per hour.
+  const sentEvents = new Map();
+
   if (inIframe) {
     log('Running inside chat iframe. Hooking fetch + XHR for get_live_chat...');
     hookFetch();
     hookXHR();
     hookInitialData();
+    bc.onmessage = (msg) => {
+      if (msg.data?.type !== 'resend' || !sentEvents.size) return;
+      log(`Parent asked for a resend - repeating ${sentEvents.size} event(s).`);
+      bc.postMessage({ type: 'events', events: [...sentEvents.values()] });
+    };
   } else {
     log('Running in parent watch page. Waiting for events over BroadcastChannel...');
   }
@@ -449,7 +488,7 @@
       const text = extractRunText(renderer.message?.runs);
       log(`Trusted message from ${authorName}:`, JSON.stringify(text));
 
-      if (!text.includes(CONFIG.markerEmoji)) {
+      if (!CONFIG.markerEmojis.some((emoji) => text.includes(emoji))) {
         log('  no marker emoji in this message - skipping.');
         continue;
       }
@@ -475,6 +514,7 @@
 
     if (found.length) {
       log(`Broadcasting ${found.length} event(s) to parent page.`);
+      for (const evt of found) sentEvents.set(String(evt.epochMs), evt);
       bc.postMessage({ type: 'events', events: found });
     }
   }
@@ -493,12 +533,13 @@
       .join('');
   }
 
-  // Splits a message on the rewind emoji since mods sometimes chain several
-  // entries in one line, e.g. "⏪ 8:14 PM - dinner⏪ 8:44 PM - post-dinner".
+  // Splits a message on the marker emoji (any of CONFIG.markerEmojis) since
+  // mods sometimes chain several entries in one line, e.g.
+  // "⏪ 8:14 PM - dinner⏪ 8:44 PM - post-dinner".
   function extractEvents(text, sentAtMs) {
     const out = [];
     const chunks = text
-      .split(CONFIG.markerEmoji)
+      .split(MARKER_SPLIT_REGEX)
       .map((c) => c.trim())
       .filter(Boolean);
 
@@ -614,7 +655,7 @@
     const seenEvents = new Map(); // key: `${epochMs}|${label}` -> {epochMs, label}
     currentSeenEvents = seenEvents;
 
-    bc.onmessage = (msg) => {
+    const onChatEvents = (msg) => {
       if (msg.data?.type !== 'events') return;
       log(`Parent received ${msg.data.events.length} event(s) from chat iframe.`);
       for (const evt of msg.data.events) {
@@ -627,6 +668,56 @@
       pruneOldEvents(seenEvents);
       renderMarkers(seenEvents);
     };
+    bc.onmessage = onChatEvents;
+
+    // Late-resolved video ID. /live-style URLs such as /@TinyKittens/live
+    // don't carry the video ID, and at document_start the player response
+    // doesn't exist yet either, so resolveVideoId() came back empty and
+    // this page is still on the unscoped fallback channel. As soon as the
+    // player response shows up, move to the same per-video channel the
+    // chat iframe is on, and ask it to repeat anything it sent before we
+    // got there. /watch?v= and /live/<id> URLs never enter this block.
+    if (!videoId) {
+      const adoptLateVideoId = () => {
+        if (videoId) return true;
+        const lateId = getVideoDetails()?.videoId;
+        if (!lateId) return false;
+        videoId = lateId;
+        channelName = `${CONFIG.channelName}:${videoId}`;
+        perVideoStorageKey = `perVideoEnabled:${videoId}`;
+        bc.close();
+        bc = new BroadcastChannel(channelName);
+        bc.onmessage = onChatEvents;
+        log(`Late-resolved videoId=${videoId} from the player response - now on channel=${channelName}`);
+        bc.postMessage({ type: 'resend' });
+        // Same per-video load + change listener the normal path does at
+        // startup, just later.
+        const storedPerVideo = GM_getValue(perVideoStorageKey, null);
+        if (storedPerVideo !== null) perVideoEnabledOverride = storedPerVideo;
+        watchPerVideoSetting();
+        renderMarkers(seenEvents);
+        if (settingsPanelEl) refreshSettingsPanel();
+        return true;
+      };
+      // DOMContentLoaded is the earliest dependable moment (the player
+      // response is an inline script, so it has run by then, and the chat
+      // iframe hasn't loaded yet); the timer is a safety net, and gives up
+      // after a minute on pages that turn out not to be a video at all.
+      pageWindow.addEventListener('DOMContentLoaded', adoptLateVideoId);
+      let attempts = 0;
+      const lateIdTimer = setInterval(() => {
+        if (adoptLateVideoId() || ++attempts >= 240) clearInterval(lateIdTimer);
+      }, 250);
+    }
+
+    // After a long stretch in a background tab, redraw once right away
+    // instead of waiting for the next interval tick (renderMarkers does
+    // nothing while the tab is hidden - see the top of that function).
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) return;
+      pruneOldEvents(seenEvents);
+      renderMarkers(seenEvents);
+    });
 
     setInterval(() => {
       pruneOldEvents(seenEvents);
@@ -901,6 +992,12 @@
   }
 
   function renderMarkers(seenEvents) {
+    // Nothing can be seen while the tab is in the background, so don't
+    // tear down and rebuild the whole marker layer every few seconds for
+    // hours on end there. The visibilitychange listener in CONTEXT B
+    // redraws the moment the tab comes back.
+    if (document.hidden) return;
+
     if (!isEnabledForThisVideo()) {
       // Clean up any markers left over from a previously-matching video,
       // in case of a client-side (SPA) navigation without a full reload.
@@ -1718,7 +1815,9 @@
     });
   }
 
-  if (perVideoStorageKey) {
+  // A function (rather than inline) so the late-resolved video ID path in
+  // CONTEXT B can register it too, once it knows the key.
+  function watchPerVideoSetting() {
     GM_addValueChangeListener(perVideoStorageKey, (name, oldValue, newValue) => {
       perVideoEnabledOverride = newValue;
       log(`Settings: per-video override = ${perVideoEnabledOverride}`);
@@ -1726,4 +1825,5 @@
       if (!inIframe && settingsPanelEl) refreshSettingsPanel();
     });
   }
+  if (perVideoStorageKey) watchPerVideoSetting();
 })();

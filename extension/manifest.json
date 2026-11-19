@@ -1,12 +1,17 @@
 {
   "manifest_version": 3,
   "name": "TinyKittens Chat Timeline Markers",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Overlays clickable markers on the TinyKittens live stream progress bar, parsed from moderator-posted chat timestamps.",
   "permissions": ["storage"],
   "content_scripts": [
     {
-      "matches": ["https://www.youtube.com/watch*"],
+      "matches": [
+        "https://www.youtube.com/watch*",
+        "https://www.youtube.com/live/*",
+        "https://www.youtube.com/*/live",
+        "https://www.youtube.com/*/live?*"
+      ],
       "js": ["content-script.js"],
       "run_at": "document_start",
       "world": "MAIN"
@@ -19,7 +24,12 @@
       "world": "MAIN"
     },
     {
-      "matches": ["https://www.youtube.com/watch*"],
+      "matches": [
+        "https://www.youtube.com/watch*",
+        "https://www.youtube.com/live/*",
+        "https://www.youtube.com/*/live",
+        "https://www.youtube.com/*/live?*"
+      ],
       "js": ["storage-bridge.js"],
       "run_at": "document_start"
     },

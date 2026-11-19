@@ -28,7 +28,11 @@
 
   function getVideoIdFromUrl(href) {
     try {
-      return new URL(href).searchParams.get('v');
+      const url = new URL(href);
+      const fromQuery = url.searchParams.get('v');
+      if (fromQuery) return fromQuery;
+      const fromLivePath = url.pathname.match(/^\/live\/([\w-]+)/);
+      return fromLivePath ? fromLivePath[1] : null;
     } catch (e) {
       return null;
     }
@@ -51,7 +55,18 @@
   }
 
   const videoId = resolveVideoId();
-  const perVideoKey = videoId ? `perVideoEnabled:${videoId}` : null;
+  // `let`: on URLs with no video ID in them (/@handle/live) this starts
+  // out null and is filled in by a 'videoId' message from content-script.js
+  // (which can read the page's player response; this isolated-world script
+  // can't) - see the message listener below.
+  let perVideoKey = videoId ? `perVideoEnabled:${videoId}` : null;
+
+  async function readPerVideoEnabled() {
+    // null = no manual override, use automatic live+channel detection
+    if (!perVideoKey) return null;
+    const localStored = await chrome.storage.local.get(perVideoKey);
+    return Object.prototype.hasOwnProperty.call(localStored, perVideoKey) ? localStored[perVideoKey] : null;
+  }
 
   function post(message) {
     window.postMessage({ source: 'cat-rescue-bridge', ...message }, location.origin);
@@ -61,15 +76,11 @@
     const stored = await chrome.storage.sync.get(GLOBAL_KEYS);
     const settings = { ...DEFAULTS, ...stored };
 
-    let perVideoEnabled = null; // null = no manual override, use automatic live+channel detection
-    if (perVideoKey) {
-      const localStored = await chrome.storage.local.get(perVideoKey);
-      if (Object.prototype.hasOwnProperty.call(localStored, perVideoKey)) {
-        perVideoEnabled = localStored[perVideoKey];
-      }
-    }
+    const perVideoEnabled = await readPerVideoEnabled();
 
-    post({ type: 'init', settings, perVideoEnabled });
+    // videoIdKnown: false tells content-script.js that it needs to supply
+    // the video ID itself (see the 'videoId' message below).
+    post({ type: 'init', settings, perVideoEnabled, videoIdKnown: !!perVideoKey });
   }
 
   // Push live updates to the page whenever storage changes elsewhere
@@ -95,7 +106,20 @@
   window.addEventListener('message', (event) => {
     if (event.source !== window || event.origin !== location.origin) return;
     const msg = event.data;
-    if (!msg || msg.source !== 'cat-rescue-page' || msg.type !== 'save') return;
+    if (!msg || msg.source !== 'cat-rescue-page') return;
+
+    // The page telling us which video this is, for URLs where we couldn't
+    // tell ourselves. A URL-derived ID is never overridden; either way,
+    // answer with the override stored for this video.
+    if (msg.type === 'videoId') {
+      if (!perVideoKey && typeof msg.videoId === 'string' && /^[\w-]+$/.test(msg.videoId)) {
+        perVideoKey = `perVideoEnabled:${msg.videoId}`;
+      }
+      readPerVideoEnabled().then((perVideoEnabled) => post({ type: 'update', perVideoEnabled }));
+      return;
+    }
+
+    if (msg.type !== 'save') return;
 
     if (msg.settings) chrome.storage.sync.set(msg.settings);
     if (perVideoKey && Object.prototype.hasOwnProperty.call(msg, 'perVideoEnabled')) {
