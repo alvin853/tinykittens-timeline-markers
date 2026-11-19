@@ -612,6 +612,312 @@
   }
 
   // =======================================================================
+  // CONTEXT A (continued): "Show timestamps" toggle in the chat's menu
+  // YouTube removed the toggle that shows a clock time next to every chat
+  // message, but the feature itself still works: the chat just reads a
+  // localStorage entry. This puts a toggle back in the chat's three-dot
+  // menu, right after the existing "Reactions" toggle, and all it does is
+  // flip that one entry - the timestamps themselves are still rendered by
+  // YouTube's own chat code.
+  //
+  // The menu is only built when it's opened, and chat messages arrive
+  // constantly, so rather than watching the DOM for it (a MutationObserver
+  // here would fire on every single message) this reacts to clicks: a
+  // click anywhere in the chat schedules a few cheap look-ups over the
+  // next second or so, which is how long the menu can take to appear.
+  // Every look-up is idempotent.
+  // =======================================================================
+  const CHAT_TIMESTAMPS_KEY = 'yt-live-chat::show-timestamps';
+  const CHAT_TIMESTAMPS_ROW_ATTR = 'data-cat-rescue-chat-timestamps';
+  const CHAT_TIMESTAMPS_TTL_MS = 315360000000; // ~10 years, like YouTube's own entry
+
+  function readChatTimestampsSetting() {
+    try {
+      const entry = JSON.parse(localStorage.getItem(CHAT_TIMESTAMPS_KEY));
+      if (!entry || (entry.expiration && entry.expiration < Date.now())) return false;
+      return entry.data === true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function writeChatTimestampsSetting(on) {
+    try {
+      const now = Date.now();
+      localStorage.setItem(
+        CHAT_TIMESTAMPS_KEY,
+        JSON.stringify({ data: on, creation: now, expiration: now + CHAT_TIMESTAMPS_TTL_MS })
+      );
+    } catch (e) {
+      log('Could not write the chat timestamps setting to localStorage.', e);
+    }
+  }
+
+  function buildChatTimestampsIcon() {
+    const svgNS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(svgNS, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('width', '24');
+    svg.setAttribute('height', '24');
+    svg.setAttribute('focusable', 'false');
+    svg.setAttribute('aria-hidden', 'true');
+    Object.assign(svg.style, { flexShrink: '0', fill: 'currentcolor', pointerEvents: 'none' });
+    const path = document.createElementNS(svgNS, 'path');
+    // A clock: the ring is the same outline as YouTube's own round icons, plus the hands.
+    path.setAttribute(
+      'd',
+      'M12 1C5.925 1 1 5.925 1 12s4.925 11 11 11 11-4.925 11-11S18.075 1 12 1Zm0 2a9 9 0 110 18.001A9 9 0 0112 3Zm-1 4a1 1 0 112 0v4.586l2.707 2.707a1 1 0 01-1.414 1.414l-3-3A1 1 0 0111 12V7Z'
+    );
+    svg.appendChild(path);
+    return svg;
+  }
+
+  // The row copies YouTube's own "Reactions" row: the same building blocks
+  // (YouTube's menu-item and toggle-switch components) with the same CSS
+  // class names, so YouTube's own styles apply to it - spacing, font,
+  // colours, the switch's look, light and dark mode alike. If those
+  // components ever aren't available, or don't render, it falls back to
+  // a hand-drawn row instead (see buildHandDrawnChatTimestampsRow).
+  const CHAT_TOGGLE_STYLE_SCOPE = 'style-scope yt-live-chat-toggle-renderer';
+  let nativeChatToggleFailed = false;
+
+  function applyChatTimestampsRowState(row, on) {
+    row.setAttribute('aria-checked', String(on));
+
+    const nativeToggle = row.querySelector('tp-yt-paper-toggle-button');
+    if (nativeToggle) {
+      nativeToggle.toggleAttribute('checked', on);
+      nativeToggle.toggleAttribute('active', on);
+      nativeToggle.setAttribute('aria-pressed', String(on));
+      try {
+        nativeToggle.checked = on;
+      } catch (e) {
+        /* the attribute above is enough */
+      }
+      return;
+    }
+
+    const track = row.querySelector('[data-part="track"]');
+    const knob = row.querySelector('[data-part="knob"]');
+    if (track) track.style.background = on ? 'var(--yt-spec-call-to-action, #3ea6ff)' : 'rgba(128, 128, 128, 0.6)';
+    if (knob) knob.style.left = on ? '14px' : '0';
+  }
+
+  // Not a clone of the "Reactions" row itself: that one is a component that
+  // builds its own insides when attached, so a clone would end up with them
+  // twice. Only its plain building blocks are created here.
+  function buildNativeChatTimestampsRow(row, referenceRow) {
+    const item = document.createElement('tp-yt-paper-item');
+    item.className = CHAT_TOGGLE_STYLE_SCOPE;
+
+    // YouTube's icon component draws from its own icon set, so our clock is
+    // a plain SVG, sized and spaced to match the neighbouring icon exactly.
+    const iconBox = document.createElement('span');
+    const referenceIcon = referenceRow.querySelector('yt-icon');
+    const iconStyle = referenceIcon ? getComputedStyle(referenceIcon) : null;
+    Object.assign(iconBox.style, { display: 'inline-flex', flexShrink: '0' });
+    for (const prop of ['width', 'height', 'marginTop', 'marginRight', 'marginBottom', 'marginLeft', 'color']) {
+      if (iconStyle && iconStyle[prop]) iconBox.style[prop] = iconStyle[prop];
+    }
+    if (!iconStyle) Object.assign(iconBox.style, { width: '24px', height: '24px', marginRight: '16px' });
+    const svg = buildChatTimestampsIcon();
+    Object.assign(svg.style, { width: '100%', height: '100%' });
+    iconBox.appendChild(svg);
+
+    const label = document.createElement('span');
+    label.className = CHAT_TOGGLE_STYLE_SCOPE;
+    label.textContent = 'Show timestamps';
+
+    // Only shows the state - clicks are handled by the whole row (see
+    // buildChatTimestampsRow), so the switch doesn't flip itself as well.
+    const toggle = document.createElement('tp-yt-paper-toggle-button');
+    toggle.className = CHAT_TOGGLE_STYLE_SCOPE;
+    toggle.setAttribute('toggles', '');
+    toggle.setAttribute('tabindex', '-1');
+    toggle.setAttribute('aria-hidden', 'true');
+    toggle.style.pointerEvents = 'none';
+
+    item.append(iconBox, label, toggle);
+    row.appendChild(item);
+  }
+
+  function buildHandDrawnChatTimestampsRow(row) {
+    row.setAttribute('tabindex', '0');
+    Object.assign(row.style, {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '16px',
+      boxSizing: 'border-box',
+      minHeight: '36px',
+      padding: '0 16px',
+      cursor: 'pointer',
+      userSelect: 'none',
+      fontFamily: 'Roboto, Arial, sans-serif',
+      fontSize: '14px',
+      color: 'var(--yt-spec-text-primary, inherit)',
+    });
+
+    row.appendChild(buildChatTimestampsIcon());
+
+    const label = document.createElement('span');
+    label.textContent = 'Show timestamps';
+    label.style.flex = '1';
+    row.appendChild(label);
+
+    const track = document.createElement('div');
+    track.setAttribute('data-part', 'track');
+    Object.assign(track.style, {
+      position: 'relative',
+      width: '34px',
+      height: '14px',
+      borderRadius: '7px',
+      flexShrink: '0',
+      transition: 'background 0.15s ease',
+    });
+    const knob = document.createElement('div');
+    knob.setAttribute('data-part', 'knob');
+    Object.assign(knob.style, {
+      position: 'absolute',
+      top: '-3px',
+      width: '20px',
+      height: '20px',
+      borderRadius: '50%',
+      background: '#fff',
+      boxShadow: '0 1px 3px rgba(0, 0, 0, 0.4)',
+      transition: 'left 0.15s ease',
+    });
+    track.appendChild(knob);
+    row.appendChild(track);
+
+    row.addEventListener('mouseenter', () => {
+      row.style.background = 'var(--yt-spec-10-percent-layer, rgba(128, 128, 128, 0.15))';
+    });
+    row.addEventListener('mouseleave', () => {
+      row.style.background = '';
+    });
+  }
+
+  function buildChatTimestampsRow(referenceRow, forceHandDrawn) {
+    const row = document.createElement('div');
+    row.setAttribute(CHAT_TIMESTAMPS_ROW_ATTR, '');
+    row.setAttribute('role', 'menuitemcheckbox');
+
+    const useNative =
+      !forceHandDrawn &&
+      !nativeChatToggleFailed &&
+      !!referenceRow &&
+      !!customElements.get('tp-yt-paper-item') &&
+      !!customElements.get('tp-yt-paper-toggle-button');
+    if (useNative) {
+      buildNativeChatTimestampsRow(row, referenceRow);
+    } else {
+      buildHandDrawnChatTimestampsRow(row);
+    }
+
+    const toggle = () => {
+      const next = !readChatTimestampsSetting();
+      writeChatTimestampsSetting(next);
+      applyChatTimestampsRowState(row, next);
+      log(`Chat timestamps ${next ? 'enabled' : 'disabled'} (localStorage ${CHAT_TIMESTAMPS_KEY}) - reloading the chat.`);
+      // YouTube's chat only reads this setting when it loads, so reload it.
+      // This script runs inside the chat's own frame, so only the chat
+      // reloads - the video keeps playing. The short delay lets the switch
+      // finish moving first, so the click visibly registered.
+      setTimeout(() => location.reload(), 350);
+    };
+    row.addEventListener('click', toggle);
+    row.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        toggle();
+      }
+    });
+    // The listbox around this row is YouTube's own, and would otherwise try
+    // to treat a click or keypress on any child as selecting one of ITS
+    // items (which can close the menu) - this row isn't one of them.
+    for (const type of ['click', 'mousedown', 'mouseup', 'touchstart', 'touchend', 'keydown']) {
+      row.addEventListener(type, (e) => e.stopPropagation());
+    }
+    return row;
+  }
+
+  // The menu measures itself once, when it opens, and keeps that height
+  // as its limit - so a row added after that point pushes it into
+  // scrolling. Ask it to measure again; this is YouTube's own sizing
+  // logic, so it still respects the space available in the chat.
+  function refitChatMenu(listbox) {
+    const dropdown = listbox.closest('tp-yt-iron-dropdown');
+    if (!dropdown || dropdown.style.display === 'none') return; // re-measures by itself the next time it opens
+    for (const target of [dropdown, dropdown.polymerController, dropdown.inst]) {
+      if (target && typeof target.refit === 'function') {
+        try {
+          target.refit();
+          log('Chat menu: re-measured the menu after adding the row.');
+          return;
+        } catch (e) {
+          break;
+        }
+      }
+    }
+    // Couldn't ask the menu to re-measure - lift the stale limit directly.
+    const popup = listbox.closest('ytd-menu-popup-renderer');
+    if (popup) {
+      popup.style.maxHeight = '';
+      popup.style.maxWidth = '';
+      log('Chat menu: cleared the menu\'s size limit after adding the row.');
+    }
+  }
+
+  function ensureChatTimestampsToggle() {
+    if (!isEnabledForThisVideo()) {
+      document.querySelectorAll(`[${CHAT_TIMESTAMPS_ROW_ATTR}]`).forEach((row) => row.remove());
+      return;
+    }
+    for (const listbox of document.querySelectorAll('ytd-menu-popup-renderer tp-yt-paper-listbox')) {
+      // Only the chat's own settings menu has toggle rows (e.g. "Reactions");
+      // the menus on individual messages and so on don't.
+      const toggles = listbox.querySelectorAll(':scope > yt-live-chat-toggle-renderer');
+      if (!toggles.length) continue;
+      const referenceRow = toggles[toggles.length - 1];
+
+      let row = listbox.querySelector(`:scope > [${CHAT_TIMESTAMPS_ROW_ATTR}]`);
+      if (!row) {
+        row = buildChatTimestampsRow(referenceRow);
+        referenceRow.after(row);
+        log('Chat menu: added the "Show timestamps" toggle.');
+        refitChatMenu(listbox);
+
+        // YouTube's switch normally draws itself the moment it's attached.
+        // If it hasn't shortly after, swap in the hand-drawn row for good.
+        const nativeToggle = row.querySelector('tp-yt-paper-toggle-button');
+        if (nativeToggle) {
+          const nativeRow = row;
+          setTimeout(() => {
+            if (nativeToggle.firstElementChild || !nativeRow.isConnected) return;
+            nativeChatToggleFailed = true;
+            log('Chat menu: YouTube\'s toggle switch did not render - using the hand-drawn one instead.');
+            const fallbackRow = buildChatTimestampsRow(referenceRow, true);
+            nativeRow.replaceWith(fallbackRow);
+            applyChatTimestampsRowState(fallbackRow, readChatTimestampsSetting());
+            refitChatMenu(listbox);
+          }, 250);
+        }
+      }
+      applyChatTimestampsRowState(row, readChatTimestampsSetting());
+    }
+  }
+
+  if (location.pathname.startsWith('/live_chat')) {
+    document.addEventListener(
+      'click',
+      () => {
+        for (const delayMs of [0, 100, 300, 700, 1500]) setTimeout(ensureChatTimestampsToggle, delayMs);
+      },
+      true
+    );
+  }
+
+  // =======================================================================
   // CONTEXT B: runs in the parent watch page
   // Responsible for: collecting broadcast events, drawing markers on the
   // real player progress bar, handling clicks to seek.
